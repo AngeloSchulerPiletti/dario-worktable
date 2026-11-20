@@ -144,14 +144,23 @@ claude_cmd() {
   return 0
 }
 
+# Type a short command that runs ROLE's chat. The full command goes in a file and is
+# sourced: keys typed before the shell's line editor is up go through the tty, which
+# (macOS MAX_CANON) drops everything after 1024 bytes, Enter included.
+launch() {
+  local issue=$1 role=$2 dir=$3 f="$STATE/$1.$2.launch"
+  claude_cmd "$issue" "$role" "$dir" > "$f"
+  tmux send-keys -t "=$issue:$role" ". $(printf %q "$f")" Enter
+}
+
 restore() {  # create the tmux session for ISSUE (detached) if it isn't running
   local issue=$1 dir
   tmux has-session -t "=$issue" 2>/dev/null && { ui_setup "$issue"; return 0; }
   dir=$(issue_dir "$issue")
   tmux new-session -d -s "$issue" -n impl -c "$dir"
-  tmux send-keys -t "=$issue:impl" "$(claude_cmd "$issue" impl "$dir")" Enter
+  launch "$issue" impl "$dir"
   tmux new-window -d -t "=$issue:" -n review -c "$dir"
-  tmux send-keys -t "=$issue:review" "$(claude_cmd "$issue" review "$dir")" Enter
+  launch "$issue" review "$dir"
   tmux new-window -d -t "=$issue:" -n shell -c "$dir"
   ui_setup "$issue"
 }
@@ -280,7 +289,7 @@ done_issue() {
   if [ -d "$dir" ]; then
     if [ "$force" = 1 ]; then rm -rf "$dir"; else rmdir "$dir" 2>/dev/null || echo "work: left ${dir/#$HOME/~} in place: it still has files (use --force to delete)" >&2; fi
   fi
-  rm -f "$(reg_file "$issue")" "$STATE/$issue.brief"
+  rm -f "$(reg_file "$issue")" "$STATE/$issue".brief "$STATE/$issue".*.launch
   echo "Done with $issue."
   # Last: if we're running inside this session, killing it ends this script too
   tmux kill-session -t "=$issue" 2>/dev/null || true
@@ -325,7 +334,7 @@ case "${1:-}" in
              [ -n "$i" ] || { [ -n "${TMUX:-}" ] && i=$(tmux display -p '#S'); }
              [ -n "$i" ] || die "usage: work done ${TEAM}-123 [-y] [--force]"
              valid_issue "$i"; done_issue "$i" "$y" "$f" ;;
-  --forget)  i=$(norm "${2:-}"); valid_issue "$i"; rm -f "$(reg_file "$i")" "$STATE/$i.brief"; echo "forgot $i" ;;
+  --forget)  i=$(norm "${2:-}"); valid_issue "$i"; rm -f "$(reg_file "$i")" "$STATE/$i".brief "$STATE/$i".*.launch; echo "forgot $i" ;;
   -h|--help) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//' ;;
   -*)        die "unknown option $1 (see work --help)" ;;
   *)         i=$(norm "$1"); valid_issue "$i"; restore "$i"; go "$i" ;;
