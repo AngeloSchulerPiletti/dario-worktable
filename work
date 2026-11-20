@@ -1,0 +1,332 @@
+#!/usr/bin/env bash
+# work — one tmux session per Linear issue, with a persistent implementer and
+# reviewer Claude Code chat each. Survives reboots by remembering session IDs.
+# Each issue gets a folder <worktrees>/wt-ABC-123; Claude creates the per-repo
+# worktrees inside it. Settings live in ~/.config/work/config (run install.sh).
+#
+#   work                         pick an issue (fzf) and open it
+#   work ABC-123                 open/restore ABC-123 (attach if already running)
+#   work new                     describe new work; Claude creates the Linear issue, then opens it
+#   work --all                   restore every known issue (detached), then pick one
+#   work --list                  show known issues, what their Claude chats are doing, repos
+#   work --link ABC-123 impl|review [SESSION_ID]
+#                                attach an existing Claude chat to a role (picker if no id)
+#   work --forget ABC-123        drop the issue from the registry (does not touch git)
+#   work done [ABC-123] [-y] [--force]
+#                                finish an issue: remove its worktrees and folder, close its
+#                                tmux session, forget it (defaults to the current session)
+set -euo pipefail
+
+# Settings: environment variables win over the config file written by install.sh
+CONFIG="${WORK_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/work/config}"
+_env_root=${WORK_ROOT:-} _env_team=${WORK_TEAM:-} _env_wt=${WORK_WORKTREES:-}
+# shellcheck source=/dev/null
+[ -f "$CONFIG" ] && . "$CONFIG"
+ROOT=${_env_root:-${WORK_ROOT:-}}
+TEAM=${_env_team:-${WORK_TEAM:-}}
+WT_DIR=${_env_wt:-${WORK_WORKTREES:-${ROOT:+$ROOT/worktrees}}}
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/work"
+SELF=$(readlink -f "$0" 2>/dev/null || echo "$0")
+PROJECTS="$HOME/.claude/projects"
+mkdir -p "$STATE"
+
+die() { echo "work: $*" >&2; exit 1; }
+need_config() {
+  [ -n "$ROOT" ] && [ -n "$TEAM" ] && [ -n "$WT_DIR" ] && return 0
+  die "not set up yet: run install.sh (or set WORK_ROOT and WORK_TEAM)"
+}
+norm() { echo "$1" | tr '[:lower:]' '[:upper:]'; }
+valid_issue() { [[ "$1" =~ ^${TEAM}-[0-9]+$ ]] || die "'$1' is not a ${TEAM}-<number> issue id"; }
+
+reg_file() { echo "$STATE/$1"; }
+reg_get() { local f; f=$(reg_file "$1"); [ -f "$f" ] && grep -E "^$2=" "$f" | tail -1 | cut -d= -f2- || true; }
+reg_set() {
+  local f; f=$(reg_file "$1"); touch "$f"
+  grep -vE "^$2=" "$f" > "$f.tmp" || true
+  echo "$2=$3" >> "$f.tmp"; mv "$f.tmp" "$f"
+}
+
+# Issue folder: registry first, else <worktrees>/wt-ISSUE (created on demand)
+issue_dir() {
+  local issue=$1 p
+  p=$(reg_get "$issue" path)
+  if [ -n "$p" ] && [ -d "$p" ]; then echo "$p"; return; fi
+  p="$WT_DIR/wt-$issue"; mkdir -p "$p"; reg_set "$issue" path "$p"; echo "$p"
+}
+
+# Repos checked out for an issue: the folder itself if it is a worktree, else its subfolders
+issue_repos() {
+  local d=$1 s
+  [ -d "$d" ] || return 0
+  if [ -e "$d/.git" ]; then
+    basename "$(dirname "$(git -C "$d" rev-parse --path-format=absolute --git-common-dir)")"; return
+  fi
+  for s in "$d"/*/; do
+    [ -e "$s.git" ] && basename "$(dirname "$(git -C "$s" rev-parse --path-format=absolute --git-common-dir)")"
+  done | paste -sd, -
+}
+
+session_file() { find "$PROJECTS" -maxdepth 2 -name "$1.jsonl" 2>/dev/null | head -1; }
+# Directory the chat was started from (Claude stores sessions per launch dir)
+session_cwd() { jq -r 'select(.cwd != null) | .cwd' "$1" 2>/dev/null | head -1; }
+
+first_prompt() {
+  local issue=$1 dir=$2 brief="$STATE/$1.brief"
+  case $3 in
+    impl) echo "You are the implementer for Linear issue $issue. Your issue folder is $dir. Read the issue, its comments and any linked PRs, and work out which of the repos in $ROOT it touches. For each one, create a git worktree at $dir/<repo> (<repo> = the repo's folder name in $ROOT): if the issue already has a PR or branch in that repo, check out that branch; otherwise create branch $(echo "$issue" | tr '[:upper:]' '[:lower:]') from the repo's default branch (git fetch origin, then git worktree add --no-track -b <branch> $dir/<repo> origin/<default>). Then summarize the issue and propose a plan; don't start coding until I confirm."
+          [ -f "$brief" ] && printf '\nThe issue was just created from this brief of mine by a quick background step that may not have been able to open every link:\n%s\n\nOnce you have read the issue and everything the brief links to, update the issue in Linear: a short, plain-language title naming what will be built (no internal codes like Q3-7), and a description that says what and why, with the key points, keeping every link. If the brief names a parent issue and the issue has none, set it.\n' "$(cat "$brief")"
+          ;;
+    review) echo "You are the reviewer for Linear issue $issue. Your issue folder is $dir; the implementer works in the repo worktrees inside it. Read the issue so you have context, then wait for me to ask for a review." ;;
+  esac
+}
+
+# ---- Claude status marks in the tmux window list ------------------------------
+# Claude Code hooks call `work _state <state>`, which tags the chat's tmux window with
+# @claude = working | needs | done; the window list shows ● ! ✓ for those.
+hooks_file() {  # settings file with the hooks, passed to every chat with --settings
+  local f="$STATE/claude-hooks.json" c="$SELF _state"
+  jq -n --arg w "$c working" --arg n "$c needs" --arg d "$c done" --arg x "$c clear" '
+    def run($cmd): [{hooks: [{type: "command", command: $cmd}]}];
+    def run($m; $cmd): [{matcher: $m, hooks: [{type: "command", command: $cmd}]}];
+    {hooks: {
+      UserPromptSubmit: run($w),
+      PostToolUse:      run("*"; $w),
+      PreToolUse:       run("AskUserQuestion"; $n),
+      Notification:     run("permission_prompt|elicitation_dialog"; $n),
+      Stop:             run($d),
+      SessionStart:     run($x),
+      SessionEnd:       run($x)
+    }}' > "$f.tmp" && mv "$f.tmp" "$f"
+  echo "$f"
+}
+
+claude_state() {  # called by the hooks, from inside the chat's tmux pane
+  local s=$1 pane=${TMUX_PANE:-}
+  [ -n "$pane" ] || return 0
+  # Finishing in the window you're looking at needs no mark
+  if [ "$s" = "done" ] && [ "$(tmux display -p -t "$pane" '#{&&:#{window_active},#{session_attached}}' 2>/dev/null)" = 1 ]; then s=clear; fi
+  if [ "$s" = clear ]; then tmux set -w -u -t "$pane" @claude 2>/dev/null || true
+  else tmux set -w -t "$pane" @claude "$s" 2>/dev/null || true; fi
+}
+
+ui_setup() {  # show the marks in ISSUE's window list; a visited window loses its ✓
+  local issue=$1 w
+  local fmt='#I:#W#{?#{==:#{@claude},working},#[fg=yellow] ●#[default],}#{?#{==:#{@claude},needs},#[fg=red]#[bold] !#[default],}#{?#{==:#{@claude},done},#[fg=green] ✓#[default],}#{?window_flags,#{window_flags}, }'
+  local clear="if -F '#{==:#{@claude},done}' 'set -w -u @claude'"
+  for w in $(tmux list-windows -t "=$issue" -F '#{window_id}'); do
+    tmux set -w -t "$w" window-status-format "$fmt"
+    tmux set -w -t "$w" window-status-current-format "$fmt"
+  done
+  # set/set-hook don't take the =exact target, so use the session's id
+  local sid; sid=$(tmux list-sessions -F '#{session_name} #{session_id}' | awk -v n="$issue" '$1==n{print $2}')
+  [ -n "$sid" ] || return 0
+  tmux set -t "$sid" status-interval 2
+  tmux set-hook -t "$sid" after-select-window "$clear"
+  tmux set-hook -t "$sid" client-session-changed "$clear"
+}
+
+# Shell command that starts or resumes the chat for ROLE
+claude_cmd() {
+  local issue=$1 role=$2 dir=$3 id f cwd
+  id=$(reg_get "$issue" "$role")
+  if [ -n "$id" ] && f=$(session_file "$id") && [ -n "$f" ]; then
+    cwd=$(session_cwd "$f"); [ -d "$cwd" ] || cwd=$dir
+    printf 'cd %q && claude --resume %q' "$cwd" "$id"
+  else
+    [ -n "$id" ] || { id=$(uuidgen | tr '[:upper:]' '[:lower:]'); reg_set "$issue" "$role" "$id"; }
+    printf 'cd %q && claude --session-id %q --name %q' "$dir" "$id" "$issue $role"
+  fi
+  printf ' --settings %q' "$(hooks_file)"
+  # First launch only: tell the chat which issue it is for (before the variadic flag below)
+  [ -z "${f:-}" ] && printf ' %q' "$(first_prompt "$issue" "$dir" "$role")"
+  # Reviewer is read-only: it can read, run tests and gh, but not edit files
+  [ "$role" = review ] && printf ' --disallowedTools Edit Write NotebookEdit'
+  return 0
+}
+
+restore() {  # create the tmux session for ISSUE (detached) if it isn't running
+  local issue=$1 dir
+  tmux has-session -t "=$issue" 2>/dev/null && { ui_setup "$issue"; return 0; }
+  dir=$(issue_dir "$issue")
+  tmux new-session -d -s "$issue" -n impl -c "$dir"
+  tmux send-keys -t "=$issue:impl" "$(claude_cmd "$issue" impl "$dir")" Enter
+  tmux new-window -d -t "=$issue:" -n review -c "$dir"
+  tmux send-keys -t "=$issue:review" "$(claude_cmd "$issue" review "$dir")" Enter
+  tmux new-window -d -t "=$issue:" -n shell -c "$dir"
+  ui_setup "$issue"
+}
+
+go() {
+  if [ -n "${TMUX:-}" ]; then tmux switch-client -t "=$1"; else tmux attach -t "=$1"; fi
+}
+
+known() {  # issues from registry + wt-* folders
+  {
+    command ls -1 "$STATE" 2>/dev/null | grep -E "^${TEAM}-[0-9]+$" || true
+    command ls -1 "$WT_DIR" 2>/dev/null | sed -nE "s#^wt-(${TEAM}-[0-9]+)\$#\1#p"
+  } | sort -u
+}
+
+list() {
+  local i dir run chats
+  for i in $(known); do
+    dir=$(reg_get "$i" path); [ -n "$dir" ] || dir="$WT_DIR/wt-$i"
+    run=- chats=
+    if tmux has-session -t "=$i" 2>/dev/null; then
+      run=running
+      chats=$(tmux list-windows -t "=$i" -F '#{window_name}:#{?@claude,#{@claude},idle}' | grep -E '^(impl|review):' | paste -sd' ' - || true)
+    fi
+    printf '%-10s %-8s %-28s %s\n' "$i" "$run" "$chats" "$(issue_repos "$dir")"
+  done
+}
+
+new_issue() {  # read a brief, have headless Claude create the Linear issue, print its id
+  local brief out issue
+  # zsh line editor: arrows/history keys work, Enter sends, pasted multi-line text stays in the box
+  brief=$(zsh -fc '
+    bindkey -e
+    print -P "\n%B%F{cyan}What are we going to work on?%f%b" >&2
+    print -P "%F{8}Describe it, paste links. Enter sends · Esc then Enter for a new line · Ctrl-C cancels%f\n" >&2
+    b=""; vared -p "%F{cyan}❯%f " b || exit 1; print -r -- "$b"') || die "cancelled"
+  [ -n "${brief//[[:space:]]/}" ] || die "nothing to work on"
+  echo "Reading the links and creating the Linear issue..." >&2
+  # GitHub links are fetched here, since the background Claude gets no shell
+  local gh_ctx="" url
+  if command -v gh >/dev/null; then
+    for url in $(printf '%s\n' "$brief" | grep -oE 'https://github\.com/[^/[:space:]]+/[^/[:space:]]+/(pull|issues)/[0-9]+' | sort -u); do
+      case $url in
+        */pull/*) gh_ctx+="
+--- $url ---
+$(gh pr view "$url" --json title,state,headRefName,baseRefName,body -q '"\(.title) [\(.state), \(.headRefName) -> \(.baseRefName)]\n\(.body)"' 2>/dev/null | head -c 4000)" ;;
+        *) gh_ctx+="
+--- $url ---
+$(gh issue view "$url" --json title,state,body -q '"\(.title) [\(.state)]\n\(.body)"' 2>/dev/null | head -c 4000)" ;;
+      esac
+    done
+  fi
+  # Free to use any connected tool (Linear, docs, web, ...), but no shell and no file edits:
+  # it reads untrusted pages, and nobody is there to approve anything
+  local tmp; tmp=$(mktemp -d)
+  out=$(cd "$tmp" && claude -p --no-session-persistence --permission-mode bypassPermissions \
+    --disallowedTools Bash Edit Write NotebookEdit Agent -- \
+"Create one Linear issue in team $TEAM from my brief below.
+First, read what the brief links to with whatever tools you have, so the issue describes the actual work. If you can't open a link, carry on without it.
+- Title: short, plain language, naming what will be built or fixed (e.g. 'Add CSV export to the reports page'). Never just repeat internal codes like 'Q3-7' or say 'build on top of PR #123'.
+- Description: what and why, the key points, and every link from the brief.
+- Assignee: me. Status: the team's In Progress (started) status.
+- If the brief names a parent issue, make this a sub-issue of it.
+Only read and create this one issue; change nothing else. End your reply with a final line exactly 'ISSUE: <identifier>'.
+
+Brief:
+$brief${gh_ctx:+
+
+Content of the GitHub links in the brief:$gh_ctx}") || { rm -rf "$tmp"; echo "$out" >&2; die "claude failed"; }
+  rm -rf "$tmp"
+  issue=$(echo "$out" | grep -oE "ISSUE: ${TEAM}-[0-9]+" | tail -1 | cut -d' ' -f2)
+  [ -n "$issue" ] || { echo "$out" >&2; die "could not create the issue"; }
+  printf '%s\n' "$brief" > "$STATE/$issue.brief"
+  echo "Created $issue" >&2
+  echo "$issue"
+}
+
+# Worktrees of an issue: the folder itself (older layout) or each repo folder inside it
+issue_worktrees() {
+  local d=$1 s
+  [ -d "$d" ] || return 0
+  if [ -e "$d/.git" ]; then echo "$d"; return; fi
+  for s in "$d"/*/; do [ -e "$s.git" ] && echo "${s%/}"; done
+  return 0
+}
+
+# Why a worktree is not safe to delete (empty if safe)
+worktree_problems() {
+  local w=$1 br n
+  [ -n "$(git -C "$w" status --porcelain 2>/dev/null)" ] && echo "uncommitted changes"
+  n=$(git -C "$w" rev-list --count HEAD --not --remotes 2>/dev/null || echo 0)
+  if [ "$n" -gt 0 ]; then
+    # Squash-merged PRs whose remote branch was deleted look unpushed; ask GitHub
+    br=$(git -C "$w" symbolic-ref --short -q HEAD || true)
+    if [ -z "$br" ] || ! (cd "$w" && gh pr list --head "$br" --state merged --json number -q '.[0].number' 2>/dev/null | grep -q .); then
+      echo "$n commit(s) not pushed and no merged PR"
+    fi
+  fi
+  return 0
+}
+
+done_issue() {
+  local issue=$1 yes=$2 force=$3 dir w p bad=0 ans
+  local -a wts=()
+  dir=$(reg_get "$issue" path); [ -n "$dir" ] || dir="$WT_DIR/wt-$issue"
+  while IFS= read -r w; do [ -n "$w" ] && wts+=("$w"); done < <(issue_worktrees "$dir")
+
+  echo "Finishing $issue:"
+  for w in ${wts[@]+"${wts[@]}"}; do
+    p=$(worktree_problems "$w")
+    if [ -n "$p" ]; then bad=1; echo "  ! ${w/#$HOME/~}  ($(echo "$p" | paste -sd ';' - | sed 's/;/; /g'))"
+    else echo "  - ${w/#$HOME/~}  (branch $(git -C "$w" symbolic-ref --short -q HEAD || echo detached))"; fi
+  done
+  [ ${#wts[@]} -gt 0 ] || echo "  (no worktrees)"
+  [ -d "$dir" ] && echo "  - folder ${dir/#$HOME/~}"
+  tmux has-session -t "=$issue" 2>/dev/null && echo "  - tmux session $issue (its Claude chats stop; they stay resumable with claude --resume)"
+  echo "  Local branches are kept."
+  if [ $bad = 1 ] && [ "$force" != 1 ]; then die "work would be lost in the worktrees marked !; rerun with --force to delete anyway"; fi
+  if [ "$yes" != 1 ]; then read -r -p "Proceed? [y/N] " ans; [[ "$ans" =~ ^[Yy] ]] || die "cancelled"; fi
+
+  local -a rmflag=(); [ "$force" = 1 ] && rmflag=(--force)
+  for w in ${wts[@]+"${wts[@]}"}; do
+    git -C "$(dirname "$(git -C "$w" rev-parse --path-format=absolute --git-common-dir)")" \
+      worktree remove ${rmflag[@]+"${rmflag[@]}"} "$w"
+  done
+  if [ -d "$dir" ]; then
+    if [ "$force" = 1 ]; then rm -rf "$dir"; else rmdir "$dir" 2>/dev/null || echo "work: left ${dir/#$HOME/~} in place: it still has files (use --force to delete)" >&2; fi
+  fi
+  rm -f "$(reg_file "$issue")" "$STATE/$issue.brief"
+  echo "Done with $issue."
+  # Last: if we're running inside this session, killing it ends this script too
+  tmux kill-session -t "=$issue" 2>/dev/null || true
+}
+
+pick() { list | fzf --prompt='issue> ' --no-sort | awk '{print $1}'; }
+
+link() {
+  local issue=$1 role=$2 id=${3:-} f
+  [[ "$role" == impl || "$role" == review ]] || die "role must be impl or review"
+  if [ -z "$id" ]; then
+    id=$(find "$PROJECTS" -maxdepth 2 -name '*.jsonl' -print0 | xargs -0 stat -f '%m %N' | sort -rn | head -60 \
+      | while read -r _ f; do
+          printf '%s\t%s\t%s\t%s\n' "$(basename "$f" .jsonl)" "$(date -r "$f" '+%m-%d %H:%M')" \
+            "$(jq -r 'select(.customTitle) | .customTitle' "$f" 2>/dev/null | tail -1)" \
+            "$(jq -r 'select(.type=="user" and (.isMeta|not)) | .message.content | if type=="string" then . else (map(select(.type=="text").text)|join(" ")) end' "$f" 2>/dev/null \
+               | grep -v '^<' | tr '\n' ' ' | head -c 120)"
+        done | fzf --delimiter='\t' --with-nth=2.. --prompt="$issue $role> " | cut -f1)
+    [ -n "$id" ] || die "nothing picked"
+  fi
+  [ -n "$(session_file "$id")" ] || die "no Claude session $id found"
+  reg_set "$issue" "$role" "$id"; echo "linked $issue $role -> $id"
+}
+
+# Hook callback from Claude Code; must never fail or need settings
+[ "${1:-}" = _state ] && { claude_state "${2:-}"; exit 0; }
+
+case "${1:-}" in -h|--help) ;; *) need_config ;; esac
+
+case "${1:-}" in
+  "")        i=$(pick); [ -n "$i" ] && { restore "$i"; go "$i"; } ;;
+  new)       i=$(new_issue); restore "$i"; go "$i" ;;
+  --list)    list ;;
+  --all)     for i in $(known); do restore "$i"; done
+             i=$(pick); [ -n "$i" ] && go "$i" ;;
+  --link)    [ $# -ge 3 ] || die "usage: work --link ISSUE impl|review [SESSION_ID]"
+             i=$(norm "$2"); valid_issue "$i"; link "$i" "$3" "${4:-}" ;;
+  done)      shift; i=""; y=0; f=0
+             for a in "$@"; do
+               case $a in -y|--yes) y=1 ;; --force) f=1 ;; -*) die "unknown option $a" ;; *) i=$(norm "$a") ;; esac
+             done
+             [ -n "$i" ] || { [ -n "${TMUX:-}" ] && i=$(tmux display -p '#S'); }
+             [ -n "$i" ] || die "usage: work done ${TEAM}-123 [-y] [--force]"
+             valid_issue "$i"; done_issue "$i" "$y" "$f" ;;
+  --forget)  i=$(norm "${2:-}"); valid_issue "$i"; rm -f "$(reg_file "$i")" "$STATE/$i.brief"; echo "forgot $i" ;;
+  -h|--help) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//' ;;
+  -*)        die "unknown option $1 (see work --help)" ;;
+  *)         i=$(norm "$1"); valid_issue "$i"; restore "$i"; go "$i" ;;
+esac
